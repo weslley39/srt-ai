@@ -40,33 +40,102 @@ const retrieveTranslation = async (text: string, language: string) => {
 	}
 };
 
-export async function POST(request: Request) {
+async function translateSingleFile(content: string, language: string, controller: ReadableStreamDefaultController, metadata: {fileName: string, fileIndex: number}) {
 	try {
-		const { content, language } = await request.json();
 		const segments = content.split(/\r\n\r\n|\n\n/).map(parseSegment);
 		const groups = groupSegmentsByTokenLength(segments, MAX_TOKENS_IN_SEGMENT);
 
 		let currentIndex = 0;
+		let resultContent = "";
 		const encoder = new TextEncoder();
+
+		// Send file start marker
+		controller.enqueue(encoder.encode(JSON.stringify({
+			type: "file_start",
+			fileName: metadata.fileName,
+			fileIndex: metadata.fileIndex
+		}) + "\n"));
+
+		for (const group of groups) {
+			const text = group.map((segment) => segment.text).join("|");
+			const translatedText = await retrieveTranslation(text, language);
+			if (!translatedText) continue;
+
+			const translatedSegments = translatedText.split("|");
+			for (const segment of translatedSegments) {
+				if (segment.trim()) {
+					const originalSegment = segments[currentIndex];
+					const srt = `${++currentIndex}\n${originalSegment?.timestamp || ""}\n${segment.trim()}\n\n`;
+					resultContent += srt;
+
+					// Send progress chunk
+					controller.enqueue(encoder.encode(JSON.stringify({
+						type: "chunk",
+						fileIndex: metadata.fileIndex,
+						content: srt
+					}) + "\n"));
+				}
+			}
+		}
+
+		// Send file end marker with complete content
+		controller.enqueue(encoder.encode(JSON.stringify({
+			type: "file_complete",
+			fileName: metadata.fileName,
+			fileIndex: metadata.fileIndex,
+			content: resultContent
+		}) + "\n"));
+
+		return resultContent;
+	} catch (error) {
+		console.error("Error translating file:", error);
+		const encoder = new TextEncoder();
+		// Send error notification
+		controller.enqueue(encoder.encode(JSON.stringify({
+			type: "file_error",
+			fileName: metadata.fileName,
+			fileIndex: metadata.fileIndex,
+			error: "Failed to translate file"
+		}) + "\n"));
+		return null;
+	}
+}
+
+export async function POST(request: Request) {
+	try {
+		const { files, language } = await request.json();
+		const encoder = new TextEncoder();
+
+		// Check if files is an array, otherwise convert to array for backward compatibility
+		const filesArray = Array.isArray(files) ? files : [{ content: files.content, name: "translation.srt" }];
 
 		const stream = new ReadableStream({
 			async start(controller) {
-				for (const group of groups) {
-					const text = group.map((segment) => segment.text).join("|");
-					const translatedText = await retrieveTranslation(text, language);
-					if (!translatedText) continue;
+				try {
+					// Process all files in parallel
+					await Promise.all(filesArray.map((file, index) =>
+						translateSingleFile(file.content, language, controller, {
+							fileName: file.name,
+							fileIndex: index
+						})
+					));
 
-					const translatedSegments = translatedText.split("|");
-					for (const segment of translatedSegments) {
-						if (segment.trim()) {
-							const originalSegment = segments[currentIndex];
-							const srt = `${++currentIndex}\n${originalSegment?.timestamp || ""}\n${segment.trim()}\n\n`;
-							controller.enqueue(encoder.encode(srt));
-						}
-					}
+					// Send completion signal
+					controller.enqueue(encoder.encode(JSON.stringify({
+						type: "all_complete",
+						count: filesArray.length
+					}) + "\n"));
+
+					controller.close();
+				} catch (error) {
+					console.error("Translation process failed:", error);
+					controller.enqueue(encoder.encode(JSON.stringify({
+						type: "error",
+						message: "Translation process failed"
+					}) + "\n"));
+					controller.close();
 				}
-				controller.close();
-			},
+			}
 		});
 
 		return new Response(stream);

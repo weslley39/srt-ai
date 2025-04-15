@@ -22,11 +22,35 @@ const triggerFileDownload = (filename: string, content: string) => {
 	element.click();
 };
 
-function Translating({ chunks }: { chunks: Chunk[] }) {
+interface TranslationStatus {
+	fileName: string;
+	fileIndex: number;
+	status: 'pending' | 'translating' | 'complete' | 'error';
+	progress: number;
+	content: string;
+}
+
+function Translating({ filesStatus }: { filesStatus: TranslationStatus[] }) {
 	return (
-		<div className="flex gap-y-2 flex-col-reverse">
-			{chunks.map((chunk) => (
-				<Timestamp key={`${chunk.index}-${chunk.start}`} {...chunk} />
+		<div className="w-full max-w-lg">
+			{filesStatus.map((file) => (
+				<div key={file.fileIndex} className="mb-4 bg-white p-4 rounded-lg shadow">
+					<div className="flex justify-between items-center mb-2">
+						<div className="font-medium truncate max-w-[70%] text-sm" title={file.fileName}>{file.fileName}</div>
+						<div className="text-sm whitespace-nowrap ml-2">
+							{file.status === 'pending' && <span className="text-gray-500">Pending...</span>}
+							{file.status === 'translating' && <span className="text-blue-500">Translating...</span>}
+							{file.status === 'complete' && <span className="text-green-500">Complete!</span>}
+							{file.status === 'error' && <span className="text-red-500">Error</span>}
+						</div>
+					</div>
+					<div className="w-full bg-gray-200 rounded-full h-2.5">
+						<div
+							className={`h-2.5 rounded-full ${file.status === 'complete' ? 'bg-green-500' : 'bg-blue-500'}`}
+							style={{ width: `${file.progress}%` }}
+						></div>
+					</div>
+				</div>
 			))}
 		</div>
 	);
@@ -34,43 +58,142 @@ function Translating({ chunks }: { chunks: Chunk[] }) {
 
 export default function Home() {
 	const [status, setStatus] = React.useState<"idle" | "busy" | "done">("idle");
+	const [filesStatus, setFilesStatus] = React.useState<TranslationStatus[]>([]);
 	const [translatedSrt, setTranslatedSrt] = React.useState("");
 	const [translatedChunks, setTranslatedChunks] = React.useState<Chunk[]>([]);
 	const [originalChunks, setOriginalChunks] = React.useState<Chunk[]>([]);
+	const [totalFilesProcessed, setTotalFilesProcessed] = React.useState(0);
+	const [totalFiles, setTotalFiles] = React.useState(0);
 
-	async function handleStream(response: Response) {
+	async function handleStream(response: Response, files: Array<{name: string}>, language: string) {
 		const data = response.body;
 		if (!data) return;
 
-		let content = "";
+		// Initialize file status tracking
+		setFilesStatus(files.map((file, index) => ({
+			fileName: file.name,
+			fileIndex: index,
+			status: 'pending',
+			progress: 0,
+			content: ''
+		})));
+
+		setTotalFiles(files.length);
+		setTotalFilesProcessed(0);
+
 		let doneReading = false;
 		const reader = data.getReader();
 		const decoder = new TextDecoder();
+		let buffer = "";
 
 		while (!doneReading) {
 			const { value, done } = await reader.read();
 			doneReading = done;
-			const chunk = decoder.decode(value);
 
-			content += `${chunk}\n\n`;
-			setTranslatedSrt((prev) => prev + chunk);
-			if (chunk.trim().length)
-				setTranslatedChunks((prev) => [...prev, parseChunk(chunk)]);
+			if (done) break;
+
+			const text = decoder.decode(value);
+			buffer += text;
+
+			// Process each line in the buffer
+			const lines = buffer.split("\n");
+			buffer = lines.pop() || ""; // Keep the last incomplete line in the buffer
+
+			for (const line of lines) {
+				if (!line.trim()) continue;
+
+				try {
+					const message = JSON.parse(line);
+
+					switch (message.type) {
+						case "file_start":
+							setFilesStatus(prev => prev.map(file =>
+								file.fileIndex === message.fileIndex
+									? { ...file, status: 'translating', progress: 5 }
+									: file
+							));
+							break;
+
+						case "chunk":
+							// Update the file's progress and content
+							setFilesStatus(prev => prev.map(file => {
+								if (file.fileIndex === message.fileIndex) {
+									const newContent = file.content + message.content;
+									// Calculate progress based on content length and estimate
+									const progress = Math.min(5 + (newContent.length / 500) * 95, 95);
+									return {
+										...file,
+										content: newContent,
+										progress: progress
+									};
+								}
+								return file;
+							}));
+
+							// Add to translation display
+							if (message.content.trim().length) {
+								const chunk = parseChunk(message.content);
+								setTranslatedChunks(prev => [...prev, chunk]);
+							}
+							break;
+
+						case "file_complete":
+							// Mark file as complete and trigger download
+							setFilesStatus(prev => prev.map(file =>
+								file.fileIndex === message.fileIndex
+									? { ...file, status: 'complete', progress: 100, content: message.content }
+									: file
+							));
+
+							// Create filename based on original name and target language
+							const fileNameWithoutExt = message.fileName.replace(/\.srt$/, '');
+							const filename = `${fileNameWithoutExt}_${language}.srt`;
+
+							triggerFileDownload(filename, message.content);
+							setTotalFilesProcessed(prev => prev + 1);
+							break;
+
+						case "file_error":
+							setFilesStatus(prev => prev.map(file =>
+								file.fileIndex === message.fileIndex
+									? { ...file, status: 'error', progress: 100 }
+									: file
+							));
+							setTotalFilesProcessed(prev => prev + 1);
+							break;
+
+						case "all_complete":
+							// All files have been processed
+							setStatus("done");
+							break;
+
+						case "error":
+							console.error("API error:", message.message);
+							setStatus("idle");
+							break;
+					}
+				} catch (e) {
+					console.error("Error parsing message:", e, line);
+				}
+			}
 		}
 
-		return content;
-
 		function parseChunk(chunkStr: string): Chunk {
-			const { id, timestamp, text } = parseSegment(chunkStr);
-			const { start, end } = parseTimestamp(timestamp);
-			return { index: id.toString(), start, end, text };
+			try {
+				const { id, timestamp, text } = parseSegment(chunkStr);
+				const { start, end } = parseTimestamp(timestamp);
+				return { index: id.toString(), start, end, text };
+			} catch (e) {
+				console.error("Error parsing chunk:", e);
+				return { index: "0", start: "00:00:00,000", end: "00:00:00,100", text: chunkStr };
+			}
 		}
 	}
 
-	async function handleSubmit(content: string, language: string) {
+	async function handleSubmit(files: Array<{content: string, name: string}>, language: string) {
 		try {
-			if (!content) {
-				console.error("No content provided");
+			if (files.length === 0) {
+				console.error("No files provided");
 				return;
 			}
 
@@ -80,66 +203,30 @@ export default function Home() {
 			setTranslatedChunks([]);
 			setOriginalChunks([]);
 
-			const segments = content.split(/\r\n\r\n|\n\n/).filter((segment) => {
-				const lines = segment.split(/\r\n|\n/);
-				const id = Number.parseInt(lines[0], 10);
-				return (
-					lines.length >= 3 && // Must have at least id, timestamp, and text
-					!Number.isNaN(id) && // First line must be a number
-					lines[1].includes(" --> ")
-				); // Second line must be a timestamp
-			});
-
-			if (!segments.length) {
-				setStatus("idle");
-				alert("Invalid SRT file format. Please check your file.");
-				return;
-			}
-
-			try {
-				const originalSegments = segments.map(parseSegment);
-				setOriginalChunks(
-					originalSegments.map((seg) => ({
-						index: seg.id.toString(),
-						start: seg.timestamp.split(" --> ")[0],
-						end: seg.timestamp.split(" --> ")[1],
-						text: seg.text,
-					})),
-				);
-			} catch (error) {
-				setStatus("idle");
-				alert("Error parsing SRT file. Please check the file format.");
-				console.error("Parsing error:", error);
-				return;
-			}
-
+			// Process all files at once via the updated API
 			const response = await fetch("/api", {
 				method: "POST",
-				body: JSON.stringify({ content, language }),
+				body: JSON.stringify({
+					files: files.map(file => ({
+						content: file.content,
+						name: file.name
+					})),
+					language
+				}),
 				headers: { "Content-Type": "application/json" },
 			});
 
 			if (response.ok) {
-				const content = await handleStream(response);
-				const filename = `${language}.srt`;
-				if (content) {
-					setStatus("done");
-					triggerFileDownload(filename, content);
-				} else {
-					setStatus("idle");
-					alert("Error occurred while reading the file");
-				}
+				await handleStream(response, files, language);
 			} else {
 				setStatus("idle");
-				console.error(
-					"Error occurred while submitting the translation request",
-				);
+				console.error("Error occurred while submitting the translation request");
 			}
 		} catch (error) {
 			setStatus("idle");
 			console.error(
-				"Error during file reading and translation request:",
-				error,
+				"Error during file translation request:",
+				error
 			);
 		}
 	}
@@ -174,13 +261,8 @@ export default function Home() {
 					>
 						Translating&hellip;
 					</h1>
-					<p>(The file will automatically download when it's done)</p>
-					<Translating
-						chunks={translatedChunks.map((chunk, i) => ({
-							...chunk,
-							originalText: originalChunks[i]?.text,
-						}))}
-					/>
+					<p className="mb-6">Translating {totalFilesProcessed}/{totalFiles} files</p>
+					<Translating filesStatus={filesStatus} />
 				</>
 			)}
 			{status === "done" && (
